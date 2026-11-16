@@ -65,10 +65,25 @@ const TRANSCRIBE_HINT = ' אם השאלה הגיעה כהקלטה קולית, ה
 // detailed answers like Gemini: whatever MAX_WORDS says, the limit is never lower than 500 words
 const MAXW = Math.min(1000, Math.max(500, parseInt(process.env.MAX_WORDS, 10) || 700));
 const EXTRA = String(process.env.EXTRA_INSTRUCTION || '').replace(/\s+/g, ' ').trim().slice(0, 2000);
+// content filter: no vulgar sexual content and no curses, in questions or in answers
+// BLOCKED_WORDS (comma separated) adds words to the filter, e.g. BLOCKED_WORDS=word1,word2
+const FILTER_ON = String(process.env.CONTENT_FILTER || '1') !== '0';
+const BLOCKED = keyList(process.env.BLOCKED_WORDS).map(w => w.toLowerCase());
+const BLOCK_RE = BLOCKED.length
+  ? new RegExp('(?<![\\u05d0-\\u05eaa-z0-9])(?:' + BLOCKED.map(w => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') + ')(?![\\u05d0-\\u05eaa-z0-9])', 'i')
+  : null;
+const hasBlocked = t => !!(FILTER_ON && BLOCK_RE && BLOCK_RE.test(String(t || '')));
+const FILTER_MSG = 'אני מעדיף לא להשיב על זה. אפשר לשאול אותי על נושא אחר';
+const FILTER_NOTE = ' xxxxx xxxxx: xxxx xx xxx xxxxx xxxxxxx. xx xxxxx xxxxxx xxxxxxxxx xxxx, xxx xxxxx xxxx xxxx xxxx xx xx xxxx xxxx. xx xxxxxx xxxx xxxx xxx, xx xxxx xxx xxxx, xxx xxxxxx xxxxx xxx xxx xxxx xxxxx xxxxx xxx. xx xx צורך להתייחס לנושא רגיש, עשה זאת בלשון נקייה ועדינה בלבד.';
+// Gemini built-in safety filters; set GEMINI_SAFETY to the threshold you want (default blocks low and above)
+const SAFETY_LEVEL = String(process.env.GEMINI_SAFETY || 'BLOCK_LOW_AND_ABOVE').trim();
+const SAFETY_SETTINGS = FILTER_ON ? ['xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx', 'HARM_CATEGORY_HARASSMENT', 'HARM_CATEGORY_HATE_SPEECH', 'HARM_CATEGORY_DANGEROUS_CONTENT'].map(c => ({ category: c, threshold: SAFETY_LEVEL })) : null;
+
 // no content filter: the assistant answers on any topic from its general knowledge
 const BROAD = ' יש לך ידע רחב בכל תחום, ואתה עונה בחופשיות ובפירוט על כל שאלה בכל נושא, כולל ספורט, חדשות, פוליטיקה, ביטחון, מדע, היסטוריה ותרבות.';
 const buildSys = (mode, extra) => 'אתה עוזר קולי בטלפון.' + BROAD +
   ' ענה בעברית כמו ג׳מיני: תשובה ארוכה, עשירה ומפורטת, זורמת ורכה לאוזן, בשפה טבעית של דיבור ובפסקאות קצרות. הרחב, הסבר את הרקע, תן דוגמאות, פרטים והקשר, והשלם את התמונה בלי למהר ובלי לקצר. אורך התשובה הוא עד ' + MAXW + ' מילים. רק לברכה או למשפט שיחתי קצר ענה בקצרה. בלי רשימות, בלי כוכביות ובלי סימנים מיוחדים, כך שיהיה נעים להקשיב לה בטלפון. המשתמש יכול לעצור את התשובה בכל רגע בהקשה על מקש ולהמשיך את השיחה, לכן שאלות המשך מתייחסות לתשובה הקודמת שלך. ' +
+  (FILTER_ON ? FILTER_NOTE + ' ' : '') +
   (EXTRA ? 'הנחיה כללית מהבעלים: ' + EXTRA + ' ' : '') +
   (extra ? 'הנחיה לשלוחה הזאת מהבעלים: ' + extra + ' ' : '') + VOICE_CTL + TRANSCRIBE_HINT + (HAS_SEARCH ? SEARCH_HINT : '') + (HAS_FOUND ? FOUND_HINT : '') + (HAS_MEDIA ? MEDIA_HINT : '');
 
@@ -165,7 +180,7 @@ async function textGen(body, deadline) {
       if (lvl) gc.thinkingConfig = { thinkingLevel: lvl };
       try {
         // 503 means the model itself is overloaded, so more keys will not help: with a backup model, give up on this one quickly
-        return await gem(model, { ...body, generationConfig: gc }, deadline, 'text', hasNext ? { retries: 0, ms: 30000 } : { ms: 40000 });
+        return await gem(model, { ...body, generationConfig: gc, ...(SAFETY_SETTINGS ? { safetySettings: SAFETY_SETTINGS } : {}) }, deadline, 'text', hasNext ? { retries: 0, ms: 30000 } : { ms: 40000 });
       } catch (e) {
         lastErr = e;
         if (e.status === 400 && /think/i.test(e.message) && (thinkIdx[model] || 0) < THINK.length - 1) { thinkIdx[model] = (thinkIdx[model] || 0) + 1; continue; }
@@ -904,6 +919,7 @@ async function doTurn(s, q, id, T0, typed) {
       let m;
       if ((m = SHORT_RE.exec(tq))) { s.len = 'short'; tq = tq.slice(m[0].length).trim() || 'אשר לי בקצרה שמעכשיו התשובות יהיו קצרות'; }
       else if ((m = LONG_RE.exec(tq))) { s.len = ''; tq = tq.slice(m[0].length).trim() || 'אשר לי בקצרה שמעכשיו התשובות יהיו מפורטות'; }
+      if (hasBlocked(tq)) return more('t-' + sp(FILTER_MSG));
       userPart = { text: 'השאלה הוקלדה במקשי הטלפון ולכן ייתכנו בה שגיאות כתיב ובלי סימני פיסוק. אם בתחילתה יש בקשה לקצר או להאריך את התשובות, זו הנחיה לגבי אורך התשובה שלך ולא חלק מהשאלה. הבן את הכוונה וענה: ' + tq };
     } else {
       const audio = await download(qn, deadline, s.d);
@@ -920,6 +936,7 @@ async function doTurn(s, q, id, T0, typed) {
     if (!text) throw new Error('empty answer ' + JSON.stringify((a.promptFeedback || {})).slice(0, 100));
     const ctl = parseCtl(text);
     text = ctl.text || 'בסדר';
+    if (hasBlocked(text) || hasBlocked(ctl.q)) { text = FILTER_MSG; ctl.q = ''; tq = hasBlocked(tq) ? '' : tq; }
     if (ctl.ctl.voice === 'male' || ctl.ctl.voice === 'female') s.vc = ctl.ctl.voice;
     else if (ctl.ctl.voice === 'default') s.vc = '';
     if (ctl.ctl.len === 'short') s.len = 'short';
